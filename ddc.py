@@ -2,136 +2,285 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import re
+import sqlite3
+import json
+from newsapi import NewsApiClient
 
-# Set up the app title and description
+# Initialize News API (replace with your API key)
+newsapi = NewsApiClient(api_key='YOUR_NEWS_API_KEY')
+
+# Database Initialization
+def init_db():
+    conn = sqlite3.connect('company_cards.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS companies
+                 (id INTEGER PRIMARY KEY,
+                  name TEXT,
+                  linkedin_url TEXT,
+                  website_url TEXT,
+                  key_personnel TEXT,
+                  contact_emails TEXT,
+                  contact_form TEXT,
+                  upcoming_events TEXT,
+                  engagement_suggestions TEXT,
+                  news TEXT,
+                  crunchbase_profile TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Database Operations
+def insert_company(data):
+    conn = sqlite3.connect('company_cards.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO companies (name, linkedin_url, website_url, key_personnel, contact_emails, contact_form, upcoming_events, engagement_suggestions, news, crunchbase_profile)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (data['name'], data['linkedin_url'], data['website_url'], json.dumps(data['key_personnel']), json.dumps(data['contact_emails']), data['contact_form'], json.dumps(data['upcoming_events']), json.dumps(data['engagement_suggestions']), json.dumps(data['news']), json.dumps(data['crunchbase_profile'])))
+    conn.commit()
+    conn.close()
+
+def update_company(id, data):
+    conn = sqlite3.connect('company_cards.db')
+    c = conn.cursor()
+    c.execute('''UPDATE companies SET name=?, linkedin_url=?, website_url=?, key_personnel=?, contact_emails=?, contact_form=?, upcoming_events=?, engagement_suggestions=?, news=?, crunchbase_profile=?
+                 WHERE id=?''',
+              (data['name'], data['linkedin_url'], data['website_url'], json.dumps(data['key_personnel']), json.dumps(data['contact_emails']), data['contact_form'], json.dumps(data['upcoming_events']), json.dumps(data['engagement_suggestions']), json.dumps(data['news']), json.dumps(data['crunchbase_profile']), id))
+    conn.commit()
+    conn.close()
+
+def get_company(id):
+    conn = sqlite3.connect('company_cards.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM companies WHERE id=?', (id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            'id': row[0], 'name': row[1], 'linkedin_url': row[2], 'website_url': row[3],
+            'key_personnel': json.loads(row[4]), 'contact_emails': json.loads(row[5]),
+            'contact_form': row[6], 'upcoming_events': json.loads(row[7]),
+            'engagement_suggestions': json.loads(row[8]), 'news': json.loads(row[9]),
+            'crunchbase_profile': json.loads(row[10])
+        }
+    return None
+
+def get_all_companies():
+    conn = sqlite3.connect('company_cards.db')
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM companies')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# Fetch News from High-Confidence Sources
+def fetch_news(company_name):
+    try:
+        response = newsapi.get_everything(q=company_name, language='en', sort_by='relevancy')
+        articles = response['articles'][:3]  # Top 3 articles
+        return [{'title': article['title'], 'source': article['source']['name'], 'published_at': article['publishedAt']} for article in articles]
+    except Exception as e:
+        st.error(f"Failed to fetch news: {str(e)}")
+        return []
+
+# Fetch Crunchbase Free Profile
+def fetch_crunchbase_profile(company_name):
+    try:
+        # Use autocomplete to find the company
+        autocomplete_url = f"https://api.crunchbase.com/v3.1/autocompletes?query={company_name}"
+        response = requests.get(autocomplete_url)
+        data = response.json()
+        if 'data' in data and 'items' in data['data'] and data['data']['items']:
+            item = data['data']['items'][0]
+            if item['type'] == 'Organization':
+                uuid = item['identifier']['uuid']
+                profile_url = f"https://api.crunchbase.com/v3.1/organizations/{uuid}"
+                response = requests.get(profile_url, params={'user_key': 'YOUR_CRUNCHBASE_API_KEY'})
+                profile = response.json()
+                if 'data' in profile:
+                    company_data = profile['data']['properties']
+                    return {
+                        'description': company_data.get('short_description', 'N/A'),
+                        'location': company_data.get('location_identifiers', [{}])[0].get('value', 'N/A'),
+                        'funding_rounds': company_data.get('num_funding_rounds', 0),
+                        'total_funding': company_data.get('funding_total', {}).get('value_usd', 0)
+                    }
+        return {}
+    except Exception as e:
+        st.error(f"Failed to fetch Crunchbase profile: {str(e)}")
+        return {}
+
+# Main Application
 st.title("Company Due Diligence Tool")
-st.write("""
-This tool helps you profile companies for engagement opportunities with the British-Portuguese Chamber of Commerce.
-Please input the required information below.
-""")
+st.write("Profile companies for engagement opportunities with the British-Portuguese Chamber of Commerce.")
 
-# Create a form for user inputs
-with st.form("company_form"):
-    company_name = st.text_input("Company Name", placeholder="e.g., Acme Corp")
-    linkedin_url = st.text_input("LinkedIn Company Page URL", placeholder="e.g., https://www.linkedin.com/company/acme-corp")
-    linkedin_posts = st.text_area("Recent LinkedIn Posts (copy-paste text)", placeholder="Paste the text of recent posts here, one per line.")
-    profiles = st.text_area("Key Personnel (name, role, LinkedIn URL, separated by commas)", placeholder="e.g., John Doe, CEO, https://linkedin.com/in/johndoe\nJane Smith, Marketing Director, https://linkedin.com/in/janesmith")
-    website_url = st.text_input("Official Website URL", placeholder="e.g., https://www.acme-corp.com")
-    submit = st.form_submit_button("Generate Company Card")
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["New Company", "Saved Companies"])
 
-# Process the inputs when the form is submitted
-if submit:
-    # Parse LinkedIn posts for events
-    events = []
-    for line in linkedin_posts.split('\n'):
-        if line.strip():
-            if any(keyword in line.lower() for keyword in ['event', 'webinar', 'conference']):
+if page == "New Company":
+    with st.form("company_form"):
+        company_name = st.text_input("Company Name", placeholder="e.g., Acme Corp")
+        linkedin_url = st.text_input("LinkedIn Company Page URL", placeholder="e.g., https://www.linkedin.com/company/acme-corp")
+        linkedin_posts = st.text_area("Recent LinkedIn Posts", placeholder="Paste recent posts, one per line.")
+        profiles = st.text_area("Key Personnel (name, role, LinkedIn URL)", placeholder="e.g., John Doe, CEO, https://linkedin.com/in/johndoe")
+        website_url = st.text_input("Official Website URL", placeholder="e.g., https://www.acme-corp.com")
+        submit = st.form_submit_button("Generate Company Card")
+
+    if submit:
+        # Parse LinkedIn Posts for Events
+        events = []
+        for line in linkedin_posts.split('\n'):
+            if line.strip() and any(keyword in line.lower() for keyword in ['event', 'webinar', 'conference']):
                 date_match = re.search(r'on (\w+ \d{1,2}, \d{4})', line)
                 date = date_match.group(1) if date_match else 'Unknown date'
                 events.append({'title': line.strip(), 'date': date})
 
-    # Parse key personnel profiles
-    key_personnel = []
-    for profile in profiles.split('\n'):
-        if profile.strip():
-            parts = [p.strip() for p in profile.split(',')]
-            if len(parts) >= 2:
-                name, role = parts[:2]
-                linkedin = parts[2] if len(parts) > 2 else ''
-                key_personnel.append({'name': name, 'role': role, 'linkedin': linkedin})
+        # Parse Key Personnel
+        key_personnel = []
+        for profile in profiles.split('\n'):
+            if profile.strip():
+                parts = [p.strip() for p in profile.split(',')]
+                if len(parts) >= 2:
+                    name, role = parts[:2]
+                    linkedin = parts[2] if len(parts) > 2 else ''
+                    key_personnel.append({'name': name, 'role': role, 'linkedin': linkedin})
 
-    # Scrape the company website
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(website_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # Scrape Website
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(website_url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            emails = list(set(re.findall(email_pattern, response.text)))[:3]
+            contact_form = soup.find('a', href=re.compile('contact|form', re.I))
+            contact_form_url = contact_form['href'] if contact_form else None
+            if contact_form_url and not contact_form_url.startswith('http'):
+                contact_form_url = website_url.rstrip('/') + '/' + contact_form_url.lstrip('/')
+            website_events = []
+            for link in soup.find_all('a', href=True):
+                if re.search(r'event|webinar|conference', link.text, re.I):
+                    website_events.append({'title': link.text.strip(), 'url': link['href']})
+        except Exception as e:
+            st.error(f"Failed to scrape website: {str(e)}")
+            emails = []
+            contact_form_url = None
+            website_events = []
 
-        # Extract emails
-        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        emails = list(set(re.findall(email_pattern, response.text)))[:3]  # Limit to 3 unique emails
+        # Fetch News and Crunchbase Data
+        news = fetch_news(company_name)
+        crunchbase_profile = fetch_crunchbase_profile(company_name)
 
-        # Look for a contact form link
-        contact_form = soup.find('a', href=re.compile('contact|form', re.I))
-        contact_form_url = contact_form['href'] if contact_form else None
-        if contact_form_url and not contact_form_url.startswith('http'):
-            contact_form_url = website_url.rstrip('/') + '/' + contact_form_url.lstrip('/')
+        # Generate Engagement Suggestions
+        suggestions = []
+        if events or website_events:
+            suggestions.append("Attend an upcoming event to network and introduce the Chamber.")
+        if emails:
+            suggestions.append("Email a contact to introduce the Chamber and discuss benefits.")
+        if contact_form_url:
+            suggestions.append(f"Use the contact form at {contact_form_url} to reach out.")
+        if key_personnel:
+            suggestions.append("Connect with key personnel on LinkedIn about UK-Portugal relations.")
+        if not suggestions:
+            suggestions.append("Research further for engagement opportunities.")
 
-        # Look for events on the website
-        website_events = []
-        for link in soup.find_all('a', href=True):
-            if re.search(r'event|webinar|conference', link.text, re.I):
-                website_events.append({'title': link.text.strip(), 'url': link['href']})
-    except Exception as e:
-        st.error(f"Failed to scrape website: {str(e)}")
-        emails = []
-        contact_form_url = None
-        website_events = []
-
-    # Generate engagement suggestions
-    suggestions = []
-    if events or website_events:
-        suggestions.append("Consider attending an upcoming event to network and introduce the British-Portuguese Chamber of Commerce.")
-    if emails:
-        suggestions.append("Send a polite email to one of the contact emails, introducing the chamber and offering to discuss potential benefits of association.")
-    if contact_form_url:
-        suggestions.append(f"Use the contact form at {contact_form_url} to send a brief message about the chamber.")
-    if key_personnel:
-        suggestions.append("Connect with key personnel on LinkedIn and engage with their posts, mentioning the chamber's role in fostering UK-Portugal business relations.")
-    if not suggestions:
-        suggestions.append("Research further to find appropriate engagement opportunities.")
-
-    # Build the company card
-    company_card = {
-        'company': {
+        # Create Company Card
+        company_card = {
             'name': company_name,
-            'linkedin': linkedin_url,
-            'website': website_url
-        },
-        'key_personnel': key_personnel,
-        'contact_information': {
-            'emails': emails,
-            'contact_form': contact_form_url
-        },
-        'upcoming_events': events + website_events,
-        'engagement_suggestions': suggestions
-    }
+            'linkedin_url': linkedin_url,
+            'website_url': website_url,
+            'key_personnel': key_personnel,
+            'contact_emails': emails,
+            'contact_form': contact_form_url,
+            'upcoming_events': events + website_events,
+            'engagement_suggestions': suggestions,
+            'news': news,
+            'crunchbase_profile': crunchbase_profile
+        }
+        st.session_state['current_card'] = company_card
+        st.session_state['edit_mode'] = False
 
-    # Display the company card
-    st.header("Company Overview")
-    st.write(f"**Name:** {company_card['company']['name']}")
-    st.write(f"**LinkedIn:** [{company_card['company']['linkedin']}]({company_card['company']['linkedin']})")
-    st.write(f"**Website:** [{company_card['company']['website']}]({company_card['company']['website']})")
+    if 'current_card' in st.session_state:
+        display_company_card(st.session_state['current_card'])
 
-    st.header("Key Personnel")
-    if key_personnel:
-        for person in key_personnel:
-            st.write(f"- {person['name']}, {person['role']}, [LinkedIn]({person['linkedin']})")
-    else:
-        st.write("No key personnel provided.")
+elif page == "Saved Companies":
+    companies = get_all_companies()
+    company_names = [company[1] for company in companies]
+    selected_company = st.selectbox("Select a Company", company_names)
+    if selected_company:
+        company_id = [company[0] for company in companies if company[1] == selected_company][0]
+        company_card = get_company(company_id)
+        st.session_state['current_card'] = company_card
+        display_company_card(company_card)
 
-    st.header("Contact Information")
-    if emails:
-        st.write(f"**Emails:** {', '.join(emails)}")
-    else:
-        st.write("No contact emails found.")
-    if contact_form_url:
-        st.write(f"**Contact Form:** [{contact_form_url}]({contact_form_url})")
-    else:
-        st.write("No contact form found.")
+# Display and Edit Company Card
+def display_company_card(card):
+    st.header("Company Card")
+    if st.button("Toggle Edit"):
+        st.session_state['edit_mode'] = not st.session_state['edit_mode']
 
-    st.header("Upcoming Events")
-    if company_card['upcoming_events']:
-        for event in company_card['upcoming_events']:
-            title = event['title']
-            date = event.get('date', 'N/A')
-            url = event.get('url', '')
-            if url:
-                st.write(f"- [{title}]({url}) ({date})")
+    if st.session_state.get('edit_mode', False):
+        # Edit Mode
+        edited_card = {
+            'name': st.text_input("Company Name", value=card['name']),
+            'linkedin_url': st.text_input("LinkedIn URL", value=card['linkedin_url']),
+            'website_url': st.text_input("Website URL", value=card['website_url']),
+            'key_personnel': card['key_personnel'],  # Editable fields can be expanded
+            'contact_emails': card['contact_emails'],
+            'contact_form': card['contact_form'],
+            'upcoming_events': card['upcoming_events'],
+            'engagement_suggestions': card['engagement_suggestions'],
+            'news': card['news'],
+            'crunchbase_profile': card['crunchbase_profile']
+        }
+        if st.button("Save"):
+            st.session_state['current_card'] = edited_card
+            st.session_state['edit_mode'] = False
+            if 'id' in card:
+                update_company(card['id'], edited_card)
             else:
-                st.write(f"- {title} ({date})")
+                insert_company(edited_card)
+            st.success("Changes saved!")
     else:
-        st.write("No upcoming events found.")
+        # View Mode
+        st.write(f"**Name:** {card['name']}")
+        st.write(f"**LinkedIn:** [{card['linkedin_url']}]({card['linkedin_url']})")
+        st.write(f"**Website:** [{card['website_url']}]({card['website_url']})")
 
-    st.header("Engagement Suggestions")
-    for suggestion in company_card['engagement_suggestions']:
-        st.write(f"- {suggestion}")
+        st.subheader("Key Personnel")
+        for person in card['key_personnel']:
+            st.write(f"- {person['name']}, {person['role']}, [LinkedIn]({person['linkedin']})")
+
+        st.subheader("Contact Information")
+        if card['contact_emails']:
+            st.write(f"**Emails:** {', '.join(card['contact_emails'])}")
+        if card['contact_form']:
+            st.write(f"**Contact Form:** [{card['contact_form']}]({card['contact_form']})")
+
+        st.subheader("Upcoming Events")
+        for event in card['upcoming_events']:
+            st.write(f"- {event['title']} ({event.get('date', 'N/A')})")
+
+        st.subheader("Engagement Suggestions")
+        for suggestion in card['engagement_suggestions']:
+            st.write(f"- {suggestion}")
+
+        st.subheader("Latest News (High-Confidence Sources)")
+        for article in card['news']:
+            st.write(f"- {article['title']} ({article['source']}, {article['published_at']})")
+
+        st.subheader("Crunchbase Profile")
+        profile = card['crunchbase_profile']
+        st.write(f"**Description:** {profile.get('description', 'N/A')}")
+        st.write(f"**Location:** {profile.get('location', 'N/A')}")
+        st.write(f"**Funding Rounds:** {profile.get('funding_rounds', 0)}")
+        st.write(f"**Total Funding:** ${profile.get('total_funding', 0):,}")
+
+        if st.button("Refresh News"):
+            news = fetch_news(card['name'])
+            card['news'] = news
+            st.session_state['current_card'] = card
+            st.rerun()
+
+        if st.button("Save to Database") and 'id' not in card:
+            insert_company(card)
+            st.success("Card saved to database!")
