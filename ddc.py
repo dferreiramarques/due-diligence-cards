@@ -6,9 +6,6 @@ import sqlite3
 import json
 from newsapi import NewsApiClient
 
-# Initialize News API (replace with your API key)
-newsapi = NewsApiClient(api_key='YOUR_NEWS_API_KEY')
-
 # Database Initialization
 def init_db():
     conn = sqlite3.connect('company_cards.db')
@@ -75,9 +72,12 @@ def get_all_companies():
 
 # Fetch News from High-Confidence Sources
 def fetch_news(company_name):
+    if 'news_api_key' not in st.session_state or not st.session_state['news_api_key']:
+        return []
+    newsapi = NewsApiClient(api_key=st.session_state['news_api_key'])
     try:
         response = newsapi.get_everything(q=company_name, language='en', sort_by='relevancy')
-        articles = response['articles'][:3]  # Top 3 articles
+        articles = response['articles'][:3]
         return [{'title': article['title'], 'source': article['source']['name'], 'published_at': article['publishedAt']} for article in articles]
     except Exception as e:
         st.error(f"Failed to fetch news: {str(e)}")
@@ -85,8 +85,9 @@ def fetch_news(company_name):
 
 # Fetch Crunchbase Free Profile
 def fetch_crunchbase_profile(company_name):
+    if 'crunchbase_api_key' not in st.session_state or not st.session_state['crunchbase_api_key']:
+        return {}
     try:
-        # Use autocomplete to find the company
         autocomplete_url = f"https://api.crunchbase.com/v3.1/autocompletes?query={company_name}"
         response = requests.get(autocomplete_url)
         data = response.json()
@@ -94,8 +95,8 @@ def fetch_crunchbase_profile(company_name):
             item = data['data']['items'][0]
             if item['type'] == 'Organization':
                 uuid = item['identifier']['uuid']
-                profile_url = f"https://api.crunchbase.com/v3.1/organizations/{uuid}"
-                response = requests.get(profile_url, params={'user_key': 'YOUR_CRUNCHBASE_API_KEY'})
+                profile_url = f"https://api.crunchbase.com/v3.1/organizations/{uuid}?user_key={st.session_state['crunchbase_api_key']}"
+                response = requests.get(profile_url)
                 profile = response.json()
                 if 'data' in profile:
                     company_data = profile['data']['properties']
@@ -110,12 +111,35 @@ def fetch_crunchbase_profile(company_name):
         st.error(f"Failed to fetch Crunchbase profile: {str(e)}")
         return {}
 
+# Fetch Web Search Results with Caching
+@st.cache(ttl=600, allow_output_mutation=True)
+def fetch_web_search_results(company_name, api_key, search_engine_id):
+    if not api_key or not search_engine_id:
+        return []
+    url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={search_engine_id}&q={company_name}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        results = response.json().get('items', [])
+        return results
+    except Exception as e:
+        st.error(f"Failed to fetch web search results: {str(e)}")
+        return []
+
 # Main Application
 st.title("Company Due Diligence Tool")
 st.write("Profile companies for engagement opportunities with the British-Portuguese Chamber of Commerce.")
 
+# Sidebar Navigation and API Settings
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["New Company", "Saved Companies"])
+
+st.sidebar.title("API Settings")
+st.sidebar.write("Enter your API keys below (optional for News and Crunchbase, required for Web Search):")
+news_api_key = st.sidebar.text_input("News API Key", type="password", key="news_api_key")
+crunchbase_api_key = st.sidebar.text_input("Crunchbase API Key", type="password", key="crunchbase_api_key")
+google_api_key = st.sidebar.text_input("Google API Key", type="password", key="google_api_key")
+search_engine_id = st.sidebar.text_input("Search Engine ID (cx)", key="search_engine_id")
 
 if page == "New Company":
     with st.form("company_form"):
@@ -224,7 +248,7 @@ def display_company_card(card):
             'name': st.text_input("Company Name", value=card['name']),
             'linkedin_url': st.text_input("LinkedIn URL", value=card['linkedin_url']),
             'website_url': st.text_input("Website URL", value=card['website_url']),
-            'key_personnel': card['key_personnel'],  # Editable fields can be expanded
+            'key_personnel': card['key_personnel'],
             'contact_emails': card['contact_emails'],
             'contact_form': card['contact_form'],
             'upcoming_events': card['upcoming_events'],
@@ -265,21 +289,42 @@ def display_company_card(card):
             st.write(f"- {suggestion}")
 
         st.subheader("Latest News (High-Confidence Sources)")
-        for article in card['news']:
-            st.write(f"- {article['title']} ({article['source']}, {article['published_at']})")
+        if card['news']:
+            for article in card['news']:
+                st.write(f"- {article['title']} ({article['source']}, {article['published_at']})")
+        else:
+            st.write("No news available. Enter News API Key in the sidebar to fetch news.")
 
         st.subheader("Crunchbase Profile")
-        profile = card['crunchbase_profile']
-        st.write(f"**Description:** {profile.get('description', 'N/A')}")
-        st.write(f"**Location:** {profile.get('location', 'N/A')}")
-        st.write(f"**Funding Rounds:** {profile.get('funding_rounds', 0)}")
-        st.write(f"**Total Funding:** ${profile.get('total_funding', 0):,}")
+        if card['crunchbase_profile']:
+            profile = card['crunchbase_profile']
+            st.write(f"**Description:** {profile.get('description', 'N/A')}")
+            st.write(f"**Location:** {profile.get('location', 'N/A')}")
+            st.write(f"**Funding Rounds:** {profile.get('funding_rounds', 0)}")
+            st.write(f"**Total Funding:** ${profile.get('total_funding', 0):,}")
+        else:
+            st.write("No Crunchbase profile available. Enter Crunchbase API Key in the sidebar to fetch profile.")
+
+        # New Web Search Results Section
+        st.subheader("Relevant Web Search Results")
+        if 'google_api_key' in st.session_state and 'search_engine_id' in st.session_state and st.session_state['google_api_key'] and st.session_state['search_engine_id']:
+            search_results = fetch_web_search_results(card['name'], st.session_state['google_api_key'], st.session_state['search_engine_id'])
+            if search_results:
+                for result in search_results[:3]:
+                    st.write(f"- [{result['title']}]({result['link']})")
+            else:
+                st.write("No recent information found.")
+        else:
+            st.write("Please enter Google API Key and Search Engine ID in the sidebar to see web search results.")
 
         if st.button("Refresh News"):
-            news = fetch_news(card['name'])
-            card['news'] = news
-            st.session_state['current_card'] = card
-            st.rerun()
+            if 'news_api_key' in st.session_state and st.session_state['news_api_key']:
+                news = fetch_news(card['name'])
+                card['news'] = news
+                st.session_state['current_card'] = card
+                st.rerun()
+            else:
+                st.warning("Please enter News API Key in the sidebar to refresh news.")
 
         if st.button("Save to Database") and 'id' not in card:
             insert_company(card)
